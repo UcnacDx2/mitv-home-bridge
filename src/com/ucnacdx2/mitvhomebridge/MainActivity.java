@@ -66,6 +66,15 @@ public class MainActivity extends Activity {
             finishOnUi("未找到可用的第三方桌面，已保留原厂桌面");
             return;
         }
+        if (homes.size() > 1) {
+            setComponent(FALLBACK, PackageManager.COMPONENT_ENABLED_STATE_DEFAULT);
+            new AlertDialog.Builder(this)
+                .setMessage("请仅保留一个第三方桌面后重试")
+                .setPositiveButton("确定", (dialog, which) -> finishWithoutTransition())
+                .setOnCancelListener(dialog -> finishWithoutTransition())
+                .show();
+            return;
+        }
         String[] labels = new String[homes.size()];
         for (int i = 0; i < homes.size(); i++) {
             ActivityInfo info = homes.get(i).activityInfo;
@@ -75,9 +84,6 @@ public class MainActivity extends Activity {
         }
         AlertDialog.Builder chooser = new AlertDialog.Builder(this)
             .setTitle("选择默认桌面");
-        if (homes.size() > 1) {
-            chooser.setMessage("检测到多个第三方桌面，请只保留一个，否则主页键可能无法进入桌面。");
-        }
         chooser.setCancelable(false)
             .setSingleChoiceItems(labels, -1, (dialog, which) -> {
                 dialog.dismiss();
