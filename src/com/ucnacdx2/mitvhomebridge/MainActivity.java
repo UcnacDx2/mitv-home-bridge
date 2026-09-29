@@ -73,9 +73,12 @@ public class MainActivity extends Activity {
             labels[i] = (label == null ? info.packageName : label.toString())
                 + "\n" + info.packageName;
         }
-        new AlertDialog.Builder(this)
-            .setTitle("选择默认桌面")
-            .setCancelable(false)
+        AlertDialog.Builder chooser = new AlertDialog.Builder(this)
+            .setTitle("选择默认桌面");
+        if (homes.size() > 1) {
+            chooser.setMessage("检测到多个第三方桌面，请只保留一个，否则主页键可能无法进入桌面。");
+        }
+        chooser.setCancelable(false)
             .setSingleChoiceItems(labels, -1, (dialog, which) -> {
                 dialog.dismiss();
                 activateAlternativeHome(homes.get(which));
