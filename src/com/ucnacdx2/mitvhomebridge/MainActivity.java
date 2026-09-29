@@ -38,6 +38,8 @@ public class MainActivity extends Activity {
         TVHOME_PACKAGE, "com.mitv.tvhome.MainActivityUserMode");
     private static final ComponentName FALLBACK = new ComponentName(
         FALLBACK_PACKAGE, "com.xiaomi.mitv.settings.entry.FallbackHome");
+    private static final int STORAGE_REQUEST = 1001;
+    private boolean bridgeStarted;
 
     @Override
     protected void onCreate(Bundle state) {
@@ -46,6 +48,27 @@ public class MainActivity extends Activity {
         // while the Binder operation runs and suppress ROM window transitions.
         getWindow().setWindowAnimations(0);
         getWindow().setDimAmount(0f);
+        if (Build.VERSION.SDK_INT >= 23
+            && checkSelfPermission(android.Manifest.permission.WRITE_EXTERNAL_STORAGE)
+                != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(new String[] {
+                android.Manifest.permission.READ_EXTERNAL_STORAGE,
+                android.Manifest.permission.WRITE_EXTERNAL_STORAGE
+            }, STORAGE_REQUEST);
+            return;
+        }
+        startBridge();
+    }
+
+    @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == STORAGE_REQUEST) startBridge();
+    }
+
+    private void startBridge() {
+        if (bridgeStarted) return;
+        bridgeStarted = true;
         final boolean fromTvHome = isLaunchedFromTvHome();
         new Thread(() -> {
             disableUpgrade();
