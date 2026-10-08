@@ -26,6 +26,30 @@ TvService；只有 TvService 和直接 Binder 都明确失败时，才使用 `su
 `com.xiaomi.mitv.upgrade` 在 bridge 启动时直接设置为 disabled。该行为不依赖桌面选择，
 Binder 失败时回退到 `pm disable-user`，并保留恢复命令供调试使用。
 
+## 安装器限制
+
+`com.android.packageinstaller` 受厂商 `pi_config` 开关约束，开关打开时原厂安装器会拒绝
+侧载。bridge 启动时（同样不依赖桌面选择）按固定顺序执行：
+
+```
+appops set --user 0 com.android.packageinstaller WRITE_SETTINGS deny
+settings --user 0 delete system pi_config
+settings --user 0 put system pi_config '{"pi_intercept_switch":false,"app_pi_control":false}'
+am force-stop --user 0 com.android.packageinstaller
+```
+
+先 deny `WRITE_SETTINGS`，安装器才无法把 `pi_config` 写回拦截状态；先 delete 再 put，
+避免旧值在写入被拒绝时残留；最后重启安装器进程使其重新读取配置。
+
+这四条**只有 root 能执行**：appop 属于别的包，需要 `MANAGE_APP_OPS_MODES`；
+`settings` / `am --user 0` 需要 `MANAGE_USERS`。普通应用在 shell 档被拒，TvService 档也被拒
+（该通道只能转发 Binder 调用，无法执行 `cmd` 分发）。因此这里直接走 `su`，**没有回退链路**：
+设备未提供 su 或被拒绝时整段跳过，只写日志，不弹提示。想让它稳定生效，用
+[mitv-optimizer](https://github.com/UcnacDx2/mitv-optimizer) 的 root service——它会在开机时
+执行同样的序列。
+
+未验证的 ROM 不适用以上假设；该行为需要在目标设备上通过 ADB 单独确认。
+
 ## 构建
 
 Windows：

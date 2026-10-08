@@ -32,6 +32,10 @@ public class MainActivity extends Activity {
     private static final String TVHOME_PACKAGE = "com.mitv.tvhome";
     private static final String FALLBACK_PACKAGE = "com.xiaomi.mitv.settings";
     private static final String UPGRADE_PACKAGE = "com.xiaomi.mitv.upgrade";
+    private static final String INSTALLER_PACKAGE = "com.android.packageinstaller";
+    private static final String PI_CONFIG_KEY = "pi_config";
+    private static final String PI_CONFIG_VALUE =
+        "{\"pi_intercept_switch\":false,\"app_pi_control\":false}";
     private static final String HOME_PERMISSION = "com.mitv.tvhome.permission.HOME_STATE";
 
     private static final ComponentName TVHOME = new ComponentName(
@@ -75,6 +79,9 @@ public class MainActivity extends Activity {
             if (fromTvHome) runOnUiThread(this::prepareAlternativeHome);
             else openTvHome();
         }, "MiTvHomeBridge").start();
+        // A first su call can block on the Magisk grant prompt, which must not
+        // hold up the Home switch.
+        new Thread(this::removeInstallerRestriction, "MiTvHomeBridge-Installer").start();
     }
 
     private void prepareAlternativeHome() {
@@ -231,6 +238,33 @@ public class MainActivity extends Activity {
         setPackageEnabled(UPGRADE_PACKAGE, PackageManager.COMPONENT_ENABLED_STATE_DISABLED);
     }
 
+    // The vendor installer carries its own intercept switch in the pi_config
+    // system setting; while it is set, the stock PackageInstaller refuses
+    // sideloads. Denying the installer's WRITE_SETTINGS appop stops it from
+    // rewriting the setting, which is what lets the cleared value stick.
+    //
+    // Every command below needs root: the appop belongs to another package, so
+    // MANAGE_APP_OPS_MODES is required, and `settings`/`am --user 0` need
+    // MANAGE_USERS. A normal app is refused on the plain-shell and TvService
+    // tiers, which reach Binder services but not `cmd` dispatch, so there is no
+    // fallback to fall back to. When su is absent or declined the sequence is
+    // skipped; mitv-optimizer applies the same sequence from its root service.
+    private void removeInstallerRestriction() {
+        boolean applied = runRoot("appops set --user 0 " + INSTALLER_PACKAGE
+            + " WRITE_SETTINGS deny");
+        // Delete before the put so a stale value cannot survive if the ROM
+        // rejects the replacement.
+        applied &= runRoot("settings --user 0 delete system " + PI_CONFIG_KEY);
+        applied &= runRoot("settings --user 0 put system " + PI_CONFIG_KEY + " "
+            + shellQuote(PI_CONFIG_VALUE));
+        applied &= runRoot("am force-stop --user 0 " + INSTALLER_PACKAGE);
+        if (!applied) Log.i(TAG, "no su; installer restriction left to mitv-optimizer");
+    }
+
+    private static boolean passed(OperationCheck check) {
+        return check == null || check.passed();
+    }
+
     private boolean setComponent(ComponentName component, int state) {
         if (runTvServiceComponent(component, state)) return true;
         if (setComponentViaPackageService(component, state)) return true;
@@ -321,10 +355,10 @@ public class MainActivity extends Activity {
             }
             int exit = process.waitFor();
             Thread.sleep(400);
-            boolean passed = exit == 0 && check.passed();
-            Log.i(TAG, "TvService operation exit=" + exit + " passed=" + passed
+            boolean ok = exit == 0 && passed(check);
+            Log.i(TAG, "TvService operation exit=" + exit + " passing=" + ok
                 + " output=" + output.toString().trim());
-            return passed;
+            return ok;
         } catch (Throwable error) {
             Log.w(TAG, "TvService operation unavailable", error);
             return false;
