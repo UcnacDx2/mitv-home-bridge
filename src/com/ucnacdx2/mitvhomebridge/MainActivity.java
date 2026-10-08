@@ -25,6 +25,7 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.concurrent.atomic.AtomicInteger;
 
 public class MainActivity extends Activity {
     private static final String TAG = "MiTVHomeBridge";
@@ -45,11 +46,19 @@ public class MainActivity extends Activity {
     private static final int TRANSACTION_APP_OPS_SET_MODE = 31;
     private static final int TRANSACTION_FORCE_STOP_PACKAGE = 83;
     private static final int OP_WRITE_SETTINGS = 23;
-    private static final String SCRIPT_FILE = "mitv-home-bridge.sh";
+    // Every TvService script gets its own pair of files, named "<prefix><n>.sh"
+    // and "<prefix><n>.result". Two threads drive TvService at once - the Home
+    // switch and the installer restriction - and they share nothing else: a fixed
+    // name let one thread's cleanup delete the other's verdict (measured on the
+    // TV: force-stop read back empty because the Home thread had just removed the
+    // file), and let one thread's script overwrite the other's.
+    private static final String FILE_PREFIX = "mitv-home-bridge.";
+    private static final AtomicInteger OPERATION_SEQUENCE = new AtomicInteger();
     // Script stdout never comes back through TvService - the reply is always an
     // empty Parcel - so a script that has to report an outcome writes it into
     // this file and the app reads it back.
-    private static final String VERDICT_FILE = "mitv-home-bridge.result";
+    private static final String VERDICT_SUFFIX = ".result";
+    private static final String SCRIPT_SUFFIX = ".sh";
     private static final String DOWNLOAD_DIR = "Download/";
     // TvService copies the script to /data/diagnosis/command.sh before running it,
     // so a script cannot derive its own directory from $0 and has to name the
@@ -309,7 +318,7 @@ public class MainActivity extends Activity {
     }
 
     private boolean denyInstallerWriteSettings(int uid) {
-        String script = tvServiceScript()
+        String verdict = runTvServiceScript(verdictPath -> tvServiceScript(verdictPath)
             + "OUT=$(/system/bin/service call appops " + TRANSACTION_APP_OPS_SET_MODE
             + " i32 " + OP_WRITE_SETTINGS + " i32 " + uid + " s16 " + INSTALLER_PACKAGE
             + " i32 " + AppOpsManager.MODE_ERRORED + " 2>&1)\n"
@@ -328,12 +337,12 @@ public class MainActivity extends Activity {
             + "case \"$STATE\" in\n"
             + "  *deny*) echo \"OK $STATE\" > $V;;\n"
             + "  *) echo \"FAIL state=[$STATE]\" > $V;;\n"
-            + "esac\n";
-        return acceptsVerdict(runTvServiceScript(script, true));
+            + "esac\n", true);
+        return acceptsVerdict(verdict);
     }
 
     private boolean forceStopInstaller() {
-        String script = tvServiceScript()
+        String verdict = runTvServiceScript(verdictPath -> tvServiceScript(verdictPath)
             + "OUT=$(/system/bin/service call activity " + TRANSACTION_FORCE_STOP_PACKAGE
             + " s16 " + INSTALLER_PACKAGE + " i32 0 2>&1)\n"
             // forceStopPackage returns void, so its reply cannot say whether the
@@ -344,12 +353,12 @@ public class MainActivity extends Activity {
             + "case \"$OUT\" in\n"
             + "  *Error*|*'does not exist'*) echo \"FAIL $OUT\" > $V;;\n"
             + "  *) echo \"OK $OUT\" > $V;;\n"
-            + "esac\n";
-        return acceptsVerdict(runTvServiceScript(script, true));
+            + "esac\n", true);
+        return acceptsVerdict(verdict);
     }
 
-    private static String tvServiceScript() {
-        return "#!/system/bin/sh\nV=" + DEVICE_DOWNLOAD_DIR + VERDICT_FILE + "\n";
+    private static String tvServiceScript(String verdictPath) {
+        return "#!/system/bin/sh\nV=" + verdictPath + "\n";
     }
 
     private static boolean acceptsVerdict(String verdict) {
@@ -423,8 +432,14 @@ public class MainActivity extends Activity {
         boolean passed();
     }
 
+    // Scripts that write a verdict need the path of their own result file, which
+    // only exists once the call has been given its sequence number.
+    private interface TvServiceScript {
+        String build(String verdictPath);
+    }
+
     private boolean runTvServiceScript(String script, OperationCheck check) {
-        String verdict = runTvServiceScript(script, false);
+        String verdict = runTvServiceScript(verdictPath -> script, false);
         boolean ok = verdict != null && passed(check);
         Log.i(TAG, "TvService operation passing=" + ok);
         return ok;
@@ -434,16 +449,18 @@ public class MainActivity extends Activity {
     // verdict it wrote, or null when the call itself could not be made; an empty
     // string means the script wrote nothing, which is normal for the operations
     // the app verifies itself.
-    private String runTvServiceScript(String script, boolean waitForVerdict) {
+    private String runTvServiceScript(TvServiceScript script, boolean waitForVerdict) {
+        String operation = FILE_PREFIX + OPERATION_SEQUENCE.incrementAndGet();
+        String verdictPath = DEVICE_DOWNLOAD_DIR + operation + VERDICT_SUFFIX;
         File scriptFile = new File(Environment.getExternalStorageDirectory(),
-            DOWNLOAD_DIR + SCRIPT_FILE);
+            DOWNLOAD_DIR + operation + SCRIPT_SUFFIX);
         File verdictFile = new File(Environment.getExternalStorageDirectory(),
-            DOWNLOAD_DIR + VERDICT_FILE);
+            DOWNLOAD_DIR + operation + VERDICT_SUFFIX);
         try {
             File parent = scriptFile.getParentFile();
             if (parent != null) parent.mkdirs();
             try (FileOutputStream output = new FileOutputStream(scriptFile, false)) {
-                output.write(script.getBytes("UTF-8"));
+                output.write(script.build(verdictPath).getBytes("UTF-8"));
             }
             // Cleared first, so a script that dies early leaves an empty verdict
             // rather than the previous operation's answer.
@@ -469,8 +486,9 @@ public class MainActivity extends Activity {
             Log.w(TAG, "TvService operation unavailable", error);
             return null;
         } finally {
-            // The file is intentionally overwritten for every operation. Do not
-            // leave a reusable root script containing stale package names.
+            // Both names belong to this call alone, so removing them cannot touch
+            // a concurrent operation's script or verdict. Do not leave a reusable
+            // root script containing stale package names.
             if (scriptFile.exists()) scriptFile.delete();
             if (verdictFile.exists()) verdictFile.delete();
         }

@@ -61,6 +61,16 @@ am force-stop --user 0 com.android.packageinstaller
 始终优先。事务号写错时框架回 `Result: Parcel(Error: ... "Not a data message")`，脚本据此判失败，
 这一点已实测。设备未提供 su 时不再弹提示，只写日志。
 
+脚本的 stdout 与退出码都不回传，所以脚本要把结论写进 `/sdcard/Download/` 下的结果文件，应用
+再轮询读回。每次调用都会分配一对**独立**文件名（`mitv-home-bridge.<n>.sh` / `.result`）：
+Home 切换与安装器限制在两个线程上并发调用 TvService，早期版本用固定文件名，实测出现过一个
+线程的清理删掉另一个线程的结论文件，让已经生效的 force-stop 被读成失败。0.3.5 起按调用编号
+隔离。
+
+0.3.5 在 finch / OS3.0.115.0.UFFMATV 上以"应用无 su"状态实测（把该 uid 的 Magisk su 策略置为
+deny）：appop 从 `allow` 改到 `deny` 并由宿主回读确认，两步都拿到各自的 `OK` 结论，
+`pi_config` 未被改动。
+
 未验证的 ROM 不适用以上假设；该行为需要在目标设备上通过 ADB 单独确认。
 
 ## 构建
