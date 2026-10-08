@@ -269,10 +269,24 @@ public class MainActivity extends Activity {
         if (runTvServiceComponent(component, state)) return true;
         if (setComponentViaPackageService(component, state)) return true;
         Log.w(TAG, "TvService and package Binder failed; trying su for " + component);
-        return runRoot("pm " + (state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED
-            ? "enable" : state == PackageManager.COMPONENT_ENABLED_STATE_DEFAULT
-            ? "default-state" : "disable-user") + " --user 0 "
-            + shellQuote(component.flattenToString()));
+        return setComponentViaRoot(component, state);
+    }
+
+    // Last resort. `pm disable` writes COMPONENT_ENABLED_STATE_DISABLED (2) rather
+    // than `disable-user` (3), because this ROM rejects 3 for the vendor Home with
+    // "invalid new component state: 3" even for uid 0 - the su path would report
+    // success and change nothing. The exit code proves nothing either, since `pm`
+    // exits 0 for a change the framework refused, so the state is read back the
+    // way the TvService path does.
+    private boolean setComponentViaRoot(ComponentName component, int state) {
+        String command = "pm " + (state == PackageManager.COMPONENT_ENABLED_STATE_ENABLED
+            ? "enable" : state == PackageManager.COMPONENT_ENABLED_STATE_DISABLED
+            ? "disable" : "default-state") + " --user 0 "
+            + shellQuote(component.flattenToString());
+        if (!runRoot(command)) return false;
+        int applied = getComponentState(component);
+        Log.i(TAG, "su component state=" + applied + " wanted=" + state + " for " + component);
+        return applied == state;
     }
 
     private boolean setPackageEnabled(String packageName, int state) {
