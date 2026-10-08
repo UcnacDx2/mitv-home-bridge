@@ -43,7 +43,10 @@ am force-stop --user 0 com.android.packageinstaller
 先 deny `WRITE_SETTINGS`，安装器才无法把 `pi_config` 写回拦截状态；先 delete 再 put，
 避免旧值在写入被拒绝时残留；最后重启安装器进程使其重新读取配置。
 
-有 root 时这四条一次走 `su` 完成。没有 root 时分成两档：
+有 root 时这四条一次走 `su` 完成。没有 root 时 bridge 只能做到前四条里的两条，原因不在
+「设备上有没有可用的命令」，而在**调用方是谁**：bridge 是普通应用（uid 10075），而
+`/system/bin/settings`、`appops`、`am` 都只是 `cmd` 的包装脚本，应用 uid 执行不了 `cmd`。
+它借 TvService 域（实测该域是 `uid=0` / `u:r:misysdiagnose:s0`）来做：
 
 - `appops` 与 `am force-stop` 换成 TvService 域内的原生 Binder 调用，不需要 root：
   `service call appops 31 i32 23 i32 <安装器 uid> s16 com.android.packageinstaller i32 2`
@@ -64,16 +67,25 @@ am force-stop --user 0 com.android.packageinstaller
 `settings get system pi_config` 回的是 `null`，说明本机原本没有这一项，vendor 缺省下拦截
 是开着的。所以「只删不写回」并不等于解除拦截，必须写进一个关闭拦截的值。
 
-这一步和上面两条相反：**普通 adb shell 就能写，不需要 root**。2026-10-08 在
-finch / OS3.0.115.0.UFFMATV 上以 uid 2000 的 adb shell 实测——写进一个安装器不识别的
-附加键，回读能看到该键，说明写入真的落盘，而不是被静默忽略：
+**普通 adb shell 就能写，不需要 root**——障碍和上面那两条一样，从来只是 bridge 自己的 uid。
+2026-10-08 在 finch / OS3.0.115.0.UFFMATV 上以 uid 2000 的 adb shell 实测：写进一个安装器
+不识别的附加键，回读能看到该键，说明写入真的落盘，而不是被静默忽略：
 
 ```sh
 adb shell settings --user 0 put system pi_config '{"pi_intercept_switch":false,"app_pi_control":false}'
 ```
 
-不要把这两类混起来：`appops` 与 `am force-stop` 在 TvService 域里能做、在 adb shell 里做不了；
-`pi_config` 反过来，在 TvService 域里做不了、在 adb shell 里能做。装过
+一个容易搞混的地方：上面这一档说的只是「bridge 应用自己做不到」。**这四条在普通 adb shell
+里其实全部可用、一条都不需要 root**——2026-10-08 在 finch 上逐条实测，调用方是
+`uid=2000(shell)` / `context=u:r:shell:s0`（不是 root，adbd 也跑在 shell 下）：
+
+- `cmd appops set --user 0 com.android.packageinstaller WRITE_SETTINGS allow` → 回读 `allow`，
+  再改回 `deny` 回读 `deny`；
+- `am force-stop --user 0 com.xiaomi.aitranslate` → `pidof` 从 `30591` 变为空；
+- `settings --user 0 put system pi_config '…'` → 写进去的附加键能在回读里看到。
+
+所以 TvService 域解决的是「应用没有 root」，不是「没有可用的命令通道」。这点对用户手动补
+`pi_config` 有直接影响：不需要 root，普通 adb shell 就行（见下一节）。装过
 [mitv-optimizer](https://github.com/UcnacDx2/mitv-optimizer)（有 Magisk）的话，它的 root
 service 每次开机都会替用户做掉这一步，不需要手动补。
 
