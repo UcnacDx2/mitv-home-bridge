@@ -10,8 +10,6 @@ import android.content.pm.ResolveInfo;
 import android.net.Uri;
 import android.os.Build;
 import android.os.Bundle;
-import android.os.IBinder;
-import android.os.Parcel;
 import android.os.Environment;
 import android.util.Log;
 import android.widget.Toast;
@@ -20,8 +18,6 @@ import java.io.BufferedReader;
 import java.io.File;
 import java.io.FileOutputStream;
 import java.io.InputStreamReader;
-import java.lang.reflect.Field;
-import java.lang.reflect.Method;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -141,10 +137,10 @@ public class MainActivity extends Activity {
             finishOnUi("TvService 无法禁用原厂桌面，已保留原厂桌面");
             return;
         }
-        boolean defaultSet = setHomeViaPackageService(home);
+        boolean defaultSet = runTvServiceHome(home);
         if (!defaultSet) {
-            // TvService and the direct Binder path both failed. Only now is a
-            // su fallback justified; a stale resolver result must not reach it.
+            // TvService failed. Only now is a su fallback justified; a stale
+            // resolver result must not reach it.
             defaultSet = runRoot("cmd package set-home-activity --user 0 "
                 + shellQuote(home.flattenToString()));
         }
@@ -267,8 +263,7 @@ public class MainActivity extends Activity {
 
     private boolean setComponent(ComponentName component, int state) {
         if (runTvServiceComponent(component, state)) return true;
-        if (setComponentViaPackageService(component, state)) return true;
-        Log.w(TAG, "TvService and package Binder failed; trying su for " + component);
+        Log.w(TAG, "TvService component operation failed; trying su for " + component);
         return setComponentViaRoot(component, state);
     }
 
@@ -291,26 +286,8 @@ public class MainActivity extends Activity {
 
     private boolean setPackageEnabled(String packageName, int state) {
         if (runTvServicePackage(packageName, state)) return true;
-        if (setApplicationViaPackageService(packageName, state)) return true;
-        Log.w(TAG, "TvService and package Binder failed; trying su for " + packageName);
+        Log.w(TAG, "TvService package operation failed; trying su for " + packageName);
         return runRoot("pm disable-user --user 0 " + shellQuote(packageName));
-    }
-
-    private boolean setHomeViaPackageService(ComponentName home) {
-        if (runTvServiceHome(home)) return true;
-        try {
-            Class<?> stub = Class.forName("android.content.pm.IPackageManager$Stub");
-            Method asInterface = stub.getDeclaredMethod("asInterface", IBinder.class);
-            asInterface.setAccessible(true);
-            Object service = asInterface.invoke(null, packageBinder());
-            Method method = service.getClass().getMethod("setHomeActivity", ComponentName.class, int.class);
-            method.setAccessible(true);
-            Object result = method.invoke(service, home, 0);
-            return !(result instanceof Boolean) || (Boolean) result;
-        } catch (Throwable error) {
-            Log.w(TAG, "Binder setHomeActivity unavailable", error);
-            return false;
-        }
     }
 
     private boolean runTvServiceComponent(ComponentName component, int state) {
@@ -381,61 +358,6 @@ public class MainActivity extends Activity {
             // leave a reusable root script containing stale package names.
             if (scriptFile.exists()) scriptFile.delete();
         }
-    }
-
-    private boolean setComponentViaPackageService(ComponentName component, int state) {
-        Parcel data = null;
-        Parcel reply = null;
-        try {
-            Class<?> stub = Class.forName("android.content.pm.IPackageManager$Stub");
-            Field transaction = stub.getDeclaredField("TRANSACTION_setComponentEnabledSetting");
-            transaction.setAccessible(true);
-            data = Parcel.obtain();
-            reply = Parcel.obtain();
-            data.writeInterfaceToken("android.content.pm.IPackageManager");
-            data.writeInt(1);
-            component.writeToParcel(data, 0);
-            data.writeInt(state);
-            data.writeInt(0);
-            data.writeInt(0);
-            if (Build.VERSION.SDK_INT >= 34) data.writeString(getPackageName());
-            IBinder binder = packageBinder();
-            if (!binder.transact(transaction.getInt(null), data, reply, 0)) return false;
-            reply.readException();
-            return getComponentState(component) == state;
-        } catch (Throwable error) {
-            Log.w(TAG, "Binder component operation failed: " + component, error);
-            return false;
-        } finally {
-            if (reply != null) reply.recycle();
-            if (data != null) data.recycle();
-        }
-    }
-
-    private boolean setApplicationViaPackageService(String packageName, int state) {
-        try {
-            Class<?> stub = Class.forName("android.content.pm.IPackageManager$Stub");
-            Method asInterface = stub.getDeclaredMethod("asInterface", IBinder.class);
-            asInterface.setAccessible(true);
-            Object service = asInterface.invoke(null, packageBinder());
-            Method method = service.getClass().getMethod("setApplicationEnabledSetting",
-                String.class, int.class, int.class, int.class, String.class);
-            method.setAccessible(true);
-            method.invoke(service, packageName, state, 0, 0, getPackageName());
-            return true;
-        } catch (Throwable error) {
-            Log.w(TAG, "Binder package operation failed: " + packageName, error);
-            return false;
-        }
-    }
-
-    private IBinder packageBinder() throws Exception {
-        Class<?> manager = Class.forName("android.os.ServiceManager");
-        Method getService = manager.getDeclaredMethod("getService", String.class);
-        getService.setAccessible(true);
-        IBinder binder = (IBinder) getService.invoke(null, "package");
-        if (binder == null) throw new IllegalStateException("package service unavailable");
-        return binder;
     }
 
     private int getComponentState(ComponentName component) {

@@ -1,7 +1,7 @@
 # MiTV Home Bridge
 
 独立维护的 MiTV 桌面桥接 APK。它只执行已经在目标 ROM 上验证过的包/组件操作；
-Binder 能力不足时才回退到 `su`。
+主路径是 TvService 临时 root，失败时回退到 `su`。
 
 ## 桌面护栏
 
@@ -18,13 +18,15 @@ Binder 能力不足时才回退到 `su`。
 目标 ROM 的主路径是 `service call TvService 4400`：由 `misysdiagnose` 以临时
 `uid=0` 执行脚本，脚本再调用 `/system/bin/service call package`。已在 finch/Android 14
 上验证 transaction 83、86、80 分别可用于组件禁用、包禁用和设置 Home。桌面主流程优先使用
-TvService；只有 TvService 和直接 Binder 都明确失败时，才使用 `su` 回退。恢复小米桌面时，
+TvService；TvService 失败时才使用 `su` 回退。应用进程直接调用 package Binder 的路径在本
+ROM 上必然被拒绝（PMS 要求 `CHANGE_COMPONENT_ENABLED_STATE`，普通应用无法持有），因此
+不保留该路径。恢复小米桌面时，
 若组件已通过 TvService 启用但受保护 Activity 仍不能启动，则提示用户按遥控器主页键。
 
 ## 已确认组件
 
 `com.xiaomi.mitv.upgrade` 在 bridge 启动时直接设置为 disabled。该行为不依赖桌面选择，
-Binder 失败时回退到 `pm disable-user`，并保留恢复命令供调试使用。
+TvService 失败时回退到 `su` 执行 `pm disable-user`，并保留恢复命令供调试使用。
 
 ## 安装器限制
 
