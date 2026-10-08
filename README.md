@@ -43,12 +43,23 @@ am force-stop --user 0 com.android.packageinstaller
 先 deny `WRITE_SETTINGS`，安装器才无法把 `pi_config` 写回拦截状态；先 delete 再 put，
 避免旧值在写入被拒绝时残留；最后重启安装器进程使其重新读取配置。
 
-这四条**只有 root 能执行**：appop 属于别的包，需要 `MANAGE_APP_OPS_MODES`；
-`settings` / `am --user 0` 需要 `MANAGE_USERS`。普通应用在 shell 档被拒，TvService 档也被拒
-（该通道只能转发 Binder 调用，无法执行 `cmd` 分发）。因此这里直接走 `su`，**没有回退链路**：
-设备未提供 su 或被拒绝时整段跳过，只写日志，不弹提示。想让它稳定生效，用
-[mitv-optimizer](https://github.com/UcnacDx2/mitv-optimizer) 的 root service——它会在开机时
-执行同样的序列。
+有 root 时这四条一次走 `su` 完成。没有 root 时分成两档：
+
+- `appops` 与 `am force-stop` 换成 TvService 域内的原生 Binder 调用，不需要 root：
+  `service call appops 31 i32 23 i32 <安装器 uid> s16 com.android.packageinstaller i32 2`
+  和 `service call activity 83 s16 com.android.packageinstaller i32 0`。两条在
+  finch / OS3.0.115.0.UFFMATV 上实测有效：appop 改完后用 `dumpsys appops` 回读为
+  `WRITE_SETTINGS (deny)`，force-stop 调用被框架接受。注意 `forceStopPackage` 返回 void，
+  它的回执无法证明进程真被杀（对一个不存在的包调用时回执一模一样），只有 appop 那一步
+  有真回读。
+- `settings delete/put system pi_config` **没有**第二条链路：`settings` 只是
+  `/system/bin/cmd` 的包装，而这个域既不能执行 `cmd`，也取不到 settings 的 Binder
+  （服务描述符为空）。这一步留给用户手动执行，或交给
+  [mitv-optimizer](https://github.com/UcnacDx2/mitv-optimizer) 的 root service 在开机时完成。
+
+两个 transaction 号（31 / 83）与 op 下标（23）取自本机型，会随 ROM 版本漂移，所以 su 路径
+始终优先。事务号写错时框架回 `Result: Parcel(Error: ... "Not a data message")`，脚本据此判失败，
+这一点已实测。设备未提供 su 时不再弹提示，只写日志。
 
 未验证的 ROM 不适用以上假设；该行为需要在目标设备上通过 ADB 单独确认。
 

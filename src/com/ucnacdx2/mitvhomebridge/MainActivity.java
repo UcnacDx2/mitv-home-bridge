@@ -2,6 +2,7 @@ package com.ucnacdx2.mitvhomebridge;
 
 import android.app.Activity;
 import android.app.AlertDialog;
+import android.app.AppOpsManager;
 import android.content.ComponentName;
 import android.content.Intent;
 import android.content.pm.ActivityInfo;
@@ -16,7 +17,9 @@ import android.widget.Toast;
 
 import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileInputStream;
 import java.io.FileOutputStream;
+import java.io.IOException;
 import java.io.InputStreamReader;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -33,6 +36,26 @@ public class MainActivity extends Activity {
     private static final String PI_CONFIG_VALUE =
         "{\"pi_intercept_switch\":false,\"app_pi_control\":false}";
     private static final String HOME_PERMISSION = "com.mitv.tvhome.permission.HOME_STATE";
+
+    // Raw Binder transactions for the installer-restriction steps that have no
+    // `cmd` front end in the misysdiagnose domain: IAppOpsService.setMode and
+    // IActivityManager.forceStopPackage. The two numbers and the op index below
+    // were measured on this ROM (finch, OS3.0.115.0.UFFMATV); they drift between
+    // releases, which is why the su path stays first.
+    private static final int TRANSACTION_APP_OPS_SET_MODE = 31;
+    private static final int TRANSACTION_FORCE_STOP_PACKAGE = 83;
+    private static final int OP_WRITE_SETTINGS = 23;
+    private static final String SCRIPT_FILE = "mitv-home-bridge.sh";
+    // Script stdout never comes back through TvService - the reply is always an
+    // empty Parcel - so a script that has to report an outcome writes it into
+    // this file and the app reads it back.
+    private static final String VERDICT_FILE = "mitv-home-bridge.result";
+    private static final String DOWNLOAD_DIR = "Download/";
+    // TvService copies the script to /data/diagnosis/command.sh before running it,
+    // so a script cannot derive its own directory from $0 and has to name the
+    // verdict file outright. The domain reaches external storage as /sdcard, where
+    // the app sees the same file under its Environment download directory.
+    private static final String DEVICE_DOWNLOAD_DIR = "/sdcard/Download/";
 
     private static final ComponentName TVHOME = new ComponentName(
         TVHOME_PACKAGE, "com.mitv.tvhome.MainActivityUserMode");
@@ -239,22 +262,98 @@ public class MainActivity extends Activity {
     // sideloads. Denying the installer's WRITE_SETTINGS appop stops it from
     // rewriting the setting, which is what lets the cleared value stick.
     //
-    // Every command below needs root: the appop belongs to another package, so
-    // MANAGE_APP_OPS_MODES is required, and `settings`/`am --user 0` need
-    // MANAGE_USERS. A normal app is refused on the plain-shell and TvService
-    // tiers, which reach Binder services but not `cmd` dispatch, so there is no
-    // fallback to fall back to. When su is absent or declined the sequence is
-    // skipped; mitv-optimizer applies the same sequence from its root service.
+    // With root the whole sequence runs at once, because the settings provider -
+    // reachable only as root - has to be written between the appop and the
+    // force-stop. Without root the appop and the force-stop still work through
+    // TvService (see below); the setting itself is left to the user and to
+    // mitv-optimizer's root service.
     private void removeInstallerRestriction() {
-        boolean applied = runRoot("appops set --user 0 " + INSTALLER_PACKAGE
-            + " WRITE_SETTINGS deny");
+        if (applyInstallerRestrictionAsRoot()) return;
+        applyInstallerRestrictionViaTvService();
+    }
+
+    private boolean applyInstallerRestrictionAsRoot() {
+        if (!runRoot("appops set --user 0 " + INSTALLER_PACKAGE
+            + " WRITE_SETTINGS deny")) {
+            return false;
+        }
         // Delete before the put so a stale value cannot survive if the ROM
         // rejects the replacement.
-        applied &= runRoot("settings --user 0 delete system " + PI_CONFIG_KEY);
-        applied &= runRoot("settings --user 0 put system " + PI_CONFIG_KEY + " "
+        boolean configured = runRoot("settings --user 0 delete system " + PI_CONFIG_KEY);
+        configured &= runRoot("settings --user 0 put system " + PI_CONFIG_KEY + " "
             + shellQuote(PI_CONFIG_VALUE));
-        applied &= runRoot("am force-stop --user 0 " + INSTALLER_PACKAGE);
-        if (!applied) Log.i(TAG, "no su; installer restriction left to mitv-optimizer");
+        boolean stopped = runRoot("am force-stop --user 0 " + INSTALLER_PACKAGE);
+        if (!configured || !stopped) {
+            Log.w(TAG, "su installer restriction incomplete: configured=" + configured
+                + " stopped=" + stopped);
+        }
+        return true;
+    }
+
+    // `settings`, `appops` and `am` are all thin wrappers around `cmd` here, and
+    // the misysdiagnose domain cannot run `cmd`: it fails with rc=127 before the
+    // request reaches the framework. The same operations as raw Binder calls do
+    // go through, because that domain is uid 0.
+    private void applyInstallerRestrictionViaTvService() {
+        int uid;
+        try {
+            uid = getPackageManager().getApplicationInfo(INSTALLER_PACKAGE, 0).uid;
+        } catch (PackageManager.NameNotFoundException error) {
+            Log.w(TAG, "no " + INSTALLER_PACKAGE + " on this ROM", error);
+            return;
+        }
+        boolean denied = denyInstallerWriteSettings(uid);
+        boolean stopped = forceStopInstaller();
+        Log.i(TAG, "TvService installer restriction appop=" + denied
+            + " forceStop=" + stopped + "; " + PI_CONFIG_KEY + " left to mitv-optimizer");
+    }
+
+    private boolean denyInstallerWriteSettings(int uid) {
+        String script = tvServiceScript()
+            + "OUT=$(/system/bin/service call appops " + TRANSACTION_APP_OPS_SET_MODE
+            + " i32 " + OP_WRITE_SETTINGS + " i32 " + uid + " s16 " + INSTALLER_PACKAGE
+            + " i32 " + AppOpsManager.MODE_ERRORED + " 2>&1)\n"
+            // A transaction number this ROM no longer uses answers "Not a data
+            // message" instead of reaching the service, which is the failure the
+            // guard is here for.
+            + "case \"$OUT\" in\n"
+            + "  *Error*|*'does not exist'*) echo \"FAIL call=[$OUT]\" > $V; exit;;\n"
+            + "esac\n"
+            // appops prints one block per package, and WRITE_SETTINGS is the only
+            // op this package overrides, so the line under its header is a readback
+            // of what was just set rather than a restatement of the call.
+            + "STATE=$(/system/bin/dumpsys appops 2>/dev/null"
+            + " | /system/bin/grep -A1 'Package " + INSTALLER_PACKAGE + ":'"
+            + " | /system/bin/grep WRITE_SETTINGS)\n"
+            + "case \"$STATE\" in\n"
+            + "  *deny*) echo \"OK $STATE\" > $V;;\n"
+            + "  *) echo \"FAIL state=[$STATE]\" > $V;;\n"
+            + "esac\n";
+        return acceptsVerdict(runTvServiceScript(script, true));
+    }
+
+    private boolean forceStopInstaller() {
+        String script = tvServiceScript()
+            + "OUT=$(/system/bin/service call activity " + TRANSACTION_FORCE_STOP_PACKAGE
+            + " s16 " + INSTALLER_PACKAGE + " i32 0 2>&1)\n"
+            // forceStopPackage returns void, so its reply cannot say whether the
+            // process was killed - a force-stop of a package that does not exist
+            // answers exactly like a real one. The appop readback above is the one
+            // step here that is verified; this only catches a call the framework
+            // refused or a transaction number the ROM moved.
+            + "case \"$OUT\" in\n"
+            + "  *Error*|*'does not exist'*) echo \"FAIL $OUT\" > $V;;\n"
+            + "  *) echo \"OK $OUT\" > $V;;\n"
+            + "esac\n";
+        return acceptsVerdict(runTvServiceScript(script, true));
+    }
+
+    private static String tvServiceScript() {
+        return "#!/system/bin/sh\nV=" + DEVICE_DOWNLOAD_DIR + VERDICT_FILE + "\n";
+    }
+
+    private static boolean acceptsVerdict(String verdict) {
+        return verdict != null && verdict.startsWith("OK ");
     }
 
     private static boolean passed(OperationCheck check) {
@@ -325,14 +424,30 @@ public class MainActivity extends Activity {
     }
 
     private boolean runTvServiceScript(String script, OperationCheck check) {
+        String verdict = runTvServiceScript(script, false);
+        boolean ok = verdict != null && passed(check);
+        Log.i(TAG, "TvService operation passing=" + ok);
+        return ok;
+    }
+
+    // Runs the script as uid 0 inside the misysdiagnose domain. Returns the
+    // verdict it wrote, or null when the call itself could not be made; an empty
+    // string means the script wrote nothing, which is normal for the operations
+    // the app verifies itself.
+    private String runTvServiceScript(String script, boolean waitForVerdict) {
         File scriptFile = new File(Environment.getExternalStorageDirectory(),
-            "Download/mitv-home-bridge.sh");
+            DOWNLOAD_DIR + SCRIPT_FILE);
+        File verdictFile = new File(Environment.getExternalStorageDirectory(),
+            DOWNLOAD_DIR + VERDICT_FILE);
         try {
             File parent = scriptFile.getParentFile();
             if (parent != null) parent.mkdirs();
             try (FileOutputStream output = new FileOutputStream(scriptFile, false)) {
                 output.write(script.getBytes("UTF-8"));
             }
+            // Cleared first, so a script that dies early leaves an empty verdict
+            // rather than the previous operation's answer.
+            try (FileOutputStream ignored = new FileOutputStream(verdictFile, false)) { }
             Process process = new ProcessBuilder("/system/bin/service", "call", "TvService",
                 "4400", "s16", "s", "s16", scriptFile.getAbsolutePath())
                 .redirectErrorStream(true).start();
@@ -345,19 +460,38 @@ public class MainActivity extends Activity {
                 }
             }
             int exit = process.waitFor();
-            Thread.sleep(400);
-            boolean ok = exit == 0 && passed(check);
-            Log.i(TAG, "TvService operation exit=" + exit + " passing=" + ok
+            String verdict = exit == 0 ? readVerdict(verdictFile, waitForVerdict) : null;
+            Log.i(TAG, "TvService operation exit=" + exit + " verdict="
+                + (verdict == null ? "none" : "\"" + verdict + "\"")
                 + " output=" + output.toString().trim());
-            return ok;
+            return verdict;
         } catch (Throwable error) {
             Log.w(TAG, "TvService operation unavailable", error);
-            return false;
+            return null;
         } finally {
             // The file is intentionally overwritten for every operation. Do not
             // leave a reusable root script containing stale package names.
             if (scriptFile.exists()) scriptFile.delete();
+            if (verdictFile.exists()) verdictFile.delete();
         }
+    }
+
+    // The appop readback dumps the whole ops table, which is slow enough that the
+    // verdict is polled rather than slept on. Scripts with nothing to report only
+    // need the beat the app checks its own state in.
+    private static String readVerdict(File verdictFile, boolean waitForVerdict)
+        throws InterruptedException {
+        for (int attempt = 0; attempt < (waitForVerdict ? 20 : 3); attempt++) {
+            try (BufferedReader reader = new BufferedReader(new InputStreamReader(
+                new FileInputStream(verdictFile), "UTF-8"))) {
+                String line = reader.readLine();
+                if (line != null) return line.trim();
+            } catch (IOException missing) {
+                // Not flushed yet, or never written at all.
+            }
+            Thread.sleep(150);
+        }
+        return "";
     }
 
     private int getComponentState(ComponentName component) {
