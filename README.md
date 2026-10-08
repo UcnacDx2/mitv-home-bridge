@@ -52,10 +52,30 @@ am force-stop --user 0 com.android.packageinstaller
   `WRITE_SETTINGS (deny)`，force-stop 调用被框架接受。注意 `forceStopPackage` 返回 void，
   它的回执无法证明进程真被杀（对一个不存在的包调用时回执一模一样），只有 appop 那一步
   有真回读。
-- `settings delete/put system pi_config` **没有**第二条链路：`settings` 只是
+- `settings delete/put system pi_config` 在这个域里**没有**第二条链路：`settings` 只是
   `/system/bin/cmd` 的包装，而这个域既不能执行 `cmd`，也取不到 settings 的 Binder
-  （服务描述符为空）。这一步留给用户手动执行，或交给
-  [mitv-optimizer](https://github.com/UcnacDx2/mitv-optimizer) 的 root service 在开机时完成。
+  （服务描述符为空）。所以没有 root 时这一步 bridge 自己做不到，只能由用户手动补，见下一节。
+
+### 没有 root 时手动清 pi_config
+
+`pi_config`（`system` 命名空间）是厂商下发的安装器拦截配置，里面带一份来源黑名单列表，
+开关打开时原厂安装器会按该列表拒绝侧载。它由安装器经 `appstore-upgrade.tv.mi.com`
+拉取刷新，**不是设备本地生成的**——在 finch 上，mitv-optimizer 改动它之前
+`settings get system pi_config` 回的是 `null`，说明本机原本没有这一项，vendor 缺省下拦截
+是开着的。所以「只删不写回」并不等于解除拦截，必须写进一个关闭拦截的值。
+
+这一步和上面两条相反：**普通 adb shell 就能写，不需要 root**。2026-10-08 在
+finch / OS3.0.115.0.UFFMATV 上以 uid 2000 的 adb shell 实测——写进一个安装器不识别的
+附加键，回读能看到该键，说明写入真的落盘，而不是被静默忽略：
+
+```sh
+adb shell settings --user 0 put system pi_config '{"pi_intercept_switch":false,"app_pi_control":false}'
+```
+
+不要把这两类混起来：`appops` 与 `am force-stop` 在 TvService 域里能做、在 adb shell 里做不了；
+`pi_config` 反过来，在 TvService 域里做不了、在 adb shell 里能做。装过
+[mitv-optimizer](https://github.com/UcnacDx2/mitv-optimizer)（有 Magisk）的话，它的 root
+service 每次开机都会替用户做掉这一步，不需要手动补。
 
 两个 transaction 号（31 / 83）与 op 下标（23）取自本机型，会随 ROM 版本漂移，所以 su 路径
 始终优先。事务号写错时框架回 `Result: Parcel(Error: ... "Not a data message")`，脚本据此判失败，
